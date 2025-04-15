@@ -1,0 +1,1309 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+## Software Design Document: Kafka-Cassandra Stream Processor
+
+**Version:** 1.0
+**Date:** 2023-10-27
+
+**1. Overview**
+
+This document details the design for a Java application utilizing the Kafka Streams library. The application will consume messages from a source Kafka topic, perform a transformation on the message payload, persist the transformed data to an Apache Cassandra table with specific consistency requirements, and finally publish the transformed data to a sink Kafka topic. The entire process must guarantee Exactly-Once Semantics (EOS). The application is designed for containerized deployment using Docker, with externalized configuration, health monitoring, and Prometheus metrics scraping capabilities.
+
+**2. Requirements**
+
+*   **R1:** Consume messages from a designated source Kafka topic (`source_topic`).
+*   **R2:** Deserialize and transform the message payload into a defined Data Transfer Object (DTO).
+*   **R3:** Persist the DTO into a designated Cassandra table (`data_table` within `app_keyspace`) synchronously using `QUORUM` consistency level for writes.
+*   **R4:** Serialize the DTO and produce it to a designated sink Kafka topic (`sink_topic`).
+*   **R5:** Ensure End-to-End Exactly-Once Semantics (EOS) for the processing pipeline (Source -> Transform -> Persist -> Sink).
+*   **R6:** The application must be built using Java and Maven.
+*   **R7:** The application must utilize the Kafka Streams library.
+*   **R8:** The application must be packaged as a standalone Docker image.
+*   **R9:** Application configuration (Kafka brokers, Cassandra contact points, topic names, etc.) must be loaded from files mounted via a Docker volume.
+*   **R10:** Provide a health check mechanism suitable for Docker's `HEALTHCHECK` instruction.
+*   **R11:** Expose JMX metrics from the Kafka Streams client and the Cassandra driver in a format scrapable by Prometheus.
+*   **R12:** Provide scripts to create the necessary Kafka topics (`source_topic`, `sink_topic`).
+*   **R13:** Provide scripts to create the necessary Cassandra keyspace (`app_keyspace`) and table (`data_table`).
+*   **R14:** Propose a deployment strategy using Docker Compose for initializing Kafka/Cassandra resources before starting the application.
+*   **R15:** Integration tests must use a Docker Compose environment with real Kafka (`confluentinc/cp-server:7.5.8`) and Cassandra (`datastax/dse-server:6.8.9`) instances, without mocking these dependencies.
+
+**3. Architecture Design**
+
+The application follows a single-service stream processing architecture pattern, leveraging the Kafka Streams library for managing consumption, processing, and production, including state management and fault tolerance (EOS).
+
+**3.1. High-Level Architecture Diagram (Conceptual)**
+
+```mermaid
+graph LR
+    subgraph "External Systems"
+        K_Source[(source_topic)]
+        K_Sink[(sink_topic)]
+        CDB[(Cassandra Cluster)]
+        Prom[Prometheus]
+        Docker[Docker Daemon]
+    end
+
+    subgraph "Application Container (Docker)"
+        A[Stream Processor App] -->|Writes (QUORUM)| CDB
+        A -->|Produces (EOS)| K_Sink
+        K_Source -->|Consumes (EOS)| A
+        ConfVol[/config Volume] -->|Reads Config| A
+        JMX{JMX Exporter Agent} -- Attaches --> A
+        HC{Health Check Endpoint} -- Exposed --> A
+    end
+
+    Prom -->|Scrapes :PORT| JMX
+    Docker -->|Checks /health| HC
+
+    style A fill:#ccf,stroke:#333,stroke-width:2px
+    style ConfVol fill:#eee,stroke:#999
+    style JMX fill:#f9f,stroke:#333
+    style HC fill:#f9f,stroke:#333
+```
+
+**3.2. Architectural Components (Step-by-Step)**
+
+1.  **Kafka Streams Application Core:**
+    *   **Responsibilities:**
+        *   Initialize and manage the Kafka Streams instance lifecycle.
+        *   Define and build the stream processing topology.
+        *   Configure and enforce Exactly-Once Semantics (EOS).
+        *   Coordinate interactions between transformation, persistence, and production steps within the Kafka Streams transaction boundaries.
+        *   Handle application startup, shutdown, and error recovery.
+    *   **Rationale:** Central orchestrator as mandated by the use of Kafka Streams. EOS capability is a key feature.
+    *   **Interactions:** Consumes from Kafka Consumer, orchestrates Transformation, Cassandra Persistence, and Kafka Producer steps. Reads configuration.
+    *   **Technology:** Java, Kafka Streams library (`org.apache.kafka:kafka-streams`).
+
+2.  **Configuration Loader:**
+    *   **Responsibilities:** Load application settings (Kafka brokers, Cassandra contact points, topic/keyspace/table names, security configs, etc.) from a specified file path (expected to be a mounted volume). Provide configuration values to other components.
+    *   **Rationale:** Decouples configuration from code, essential for Docker deployment and environment flexibility.
+    *   **Interactions:** Reads from the filesystem (`/config/application.properties`). Provides config data to App Core, Cassandra Repo, Health Check.
+    *   **Technology:** Java (`java.util.Properties` or a library like Apache Commons Configuration/Typesafe Config).
+
+3.  **Message Transformation Logic:**
+    *   **Responsibilities:** Receive the raw message payload (assuming String/JSON format), deserialize it, validate its structure, and transform it into the application's internal `DataTransferObject`.
+    *   **Rationale:** Separates the business logic of data transformation from the streaming and I/O mechanics. Promotes testability.
+    *   **Interactions:** Called by the Kafka Streams topology (`mapValues`, `transformValues`).
+    *   **Technology:** Java, Jackson library (`com.fasterxml.jackson.core:jackson-databind`) for JSON handling.
+
+4.  **Cassandra Persistence Layer (`CassandraRepository`):**
+    *   **Responsibilities:**
+        *   Establish and manage the connection pool to the Cassandra cluster (`CqlSession`).
+        *   Provide a method to persist the `DataTransferObject` to the configured Cassandra table.
+        *   Ensure the `INSERT` operation is performed synchronously and with `ConsistencyLevel.QUORUM`.
+        *   Handle Cassandra-specific exceptions.
+    *   **Rationale:** Encapsulates database interaction details, making the core stream processing logic cleaner. Manages resource lifecycle (`CqlSession`).
+    *   **Interactions:** Called by the Kafka Streams topology (e.g., within a `foreach` or `process` method). Connects to the Cassandra cluster.
+    *   **Technology:** Java, DataStax Java Driver for Apache Cassandra (`com.datastax.oss:java-driver-core`).
+
+5.  **Health Check Endpoint:**
+    *   **Responsibilities:** Expose an HTTP endpoint (e.g., `/health`) that reports the application's health status. Health checks should verify Kafka Streams state and connectivity to Cassandra.
+    *   **Rationale:** Allows external monitoring systems (like Docker's health check) to determine if the application is running correctly.
+    *   **Interactions:** Listens on a configured port. Responds to HTTP GET requests on `/health`. Internally checks Kafka Streams state and performs a lightweight Cassandra query.
+    *   **Technology:** Java, Simple lightweight HTTP server (e.g., `com.sun.net.httpserver`, or embedded Jetty/Netty if other dependencies bring them in).
+
+6.  **JMX Metrics Exporter:**
+    *   **Responsibilities:** Expose internal JMX metrics (provided by the Kafka Streams client library and the DataStax Cassandra driver) via an HTTP endpoint in a format Prometheus can scrape.
+    *   **Rationale:** Enables performance monitoring and alerting using standard observability tools.
+    *   **Interactions:** Runs as a Java agent attached to the application JVM. Listens on a configured port. Scrapes JMX MBeans internally. Responds to HTTP GET requests from Prometheus.
+    *   **Technology:** Prometheus JMX Exporter (Java Agent JAR + YAML configuration).
+
+**4. Implementation Design (Step-by-Step & Modular)**
+
+**4.1. Project Structure (Maven)**
+
+```
+kafka-cassandra-processor/
+├── pom.xml
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   │   └── com/example/processor/
+│   │   │       ├── StreamProcessorApp.java  # Main application class
+│   │   │       ├── config/
+│   │   │       │   └── AppConfig.java       # Configuration loading and holder
+│   │   │       ├── dto/
+│   │   │       │   └── DataTransferObject.java # Data structure
+│   │   │       ├── kafka/
+│   │   │       │   └── TopologyBuilder.java # Defines the KStreams topology
+│   │   │       ├── persistence/
+│   │   │       │   └── CassandraRepository.java # Cassandra interaction logic
+│   │   │       ├── transform/
+│   │   │       │   └── MessageTransformer.java # Payload transformation
+│   │   │       └── health/
+│   │   │           └── HealthCheckServer.java # Health check endpoint logic
+│   │   └── resources/
+│   │       └── log4j2.xml              # Logging configuration
+│   ├── test/
+│   │   ├── java/
+│   │   │   └── com/example/processor/
+│   │   │       ├── transform/
+│   │   │       │   └── MessageTransformerTest.java
+│   │   │       └── integration/
+│   │   │           └── StreamProcessorIntegrationTest.java # Full flow test
+│   │   └── resources/
+│   │       └── test-application.properties # Config for integration tests
+├── config/                     # Directory for default/example config
+│   └── application.properties
+├── scripts/
+│   ├── create_kafka_topics.sh
+│   ├── setup_cassandra_schema.sh
+│   └── schema.cql
+├── Dockerfile
+├── docker-compose.yml          # For deployment
+├── docker-compose.test.yml     # For integration testing
+└── jmx_exporter_config.yaml    # Prometheus JMX Exporter config
+```
+
+**4.2. Module: `DataTransferObject.java`**
+
+*   **Purpose:** Represents the structured data. This is a placeholder; actual fields depend on the specific use case.
+*   **Implementation:** An immutable Java class or Record.
+    ```java
+    package com.example.processor.dto;
+
+    // Example DTO - Make fields final for immutability
+    // Consider using Java Records (Java 16+) for conciseness
+    public final class DataTransferObject {
+        private final String id; // Assuming a primary key
+        private final String payloadData;
+        private final long timestamp;
+
+        public DataTransferObject(String id, String payloadData, long timestamp) {
+            this.id = id; // Add null checks if necessary
+            this.payloadData = payloadData;
+            this.timestamp = timestamp;
+        }
+
+        // Getters only
+        public String getId() { return id; }
+        public String getPayloadData() { return payloadData; }
+        public long getTimestamp() { return timestamp; }
+
+        // Implement equals(), hashCode(), toString()
+    }
+    ```
+*   **FP Principles:** Immutability ensures data consistency after creation. No side effects in getters.
+
+**4.3. Module: `AppConfig.java`**
+
+*   **Purpose:** Load and provide access to configuration properties.
+*   **Implementation:**
+    ```java
+    package com.example.processor.config;
+
+    import java.io.FileInputStream;
+    import java.io.IOException;
+    import java.io.InputStream;
+    import java.util.Properties;
+
+    public class AppConfig {
+        private final Properties properties;
+
+        public AppConfig(String configPath) throws IOException {
+            this.properties = new Properties();
+            try (InputStream input = new FileInputStream(configPath)) {
+                properties.load(input);
+            }
+        }
+
+        public String getKafkaBootstrapServers() { return properties.getProperty("kafka.bootstrap.servers"); }
+        public String getSourceTopic() { return properties.getProperty("kafka.topic.source"); }
+        public String getSinkTopic() { return properties.getProperty("kafka.topic.sink"); }
+        public String getApplicationId() { return properties.getProperty("kafka.streams.application.id", "kafka-cassandra-processor"); }
+        // ... getters for Cassandra contact points, keyspace, table, ports, etc.
+        public String getCassandraContactPoints() { return properties.getProperty("cassandra.contact-points"); }
+        public int getCassandraPort() { return Integer.parseInt(properties.getProperty("cassandra.port", "9042")); }
+        public String getCassandraKeyspace() { return properties.getProperty("cassandra.keyspace"); }
+        public String getCassandraTable() { return properties.getProperty("cassandra.table"); }
+        public String getCassandraLocalDc() { return properties.getProperty("cassandra.local-datacenter"); } // Important for driver
+        public int getHealthCheckPort() { return Integer.parseInt(properties.getProperty("health.check.port", "8080")); }
+    }
+    ```
+*   **FP Principles:** The `AppConfig` object itself is effectively immutable after construction. The constructor is pure relative to its input (path) if the file system is considered stable during the call.
+
+**4.4. Module: `MessageTransformer.java`**
+
+*   **Purpose:** Transform raw input string (JSON) to `DataTransferObject`.
+*   **Function:** `public Optional<DataTransferObject> transform(String jsonPayload)`
+    *   **Input:** `String jsonPayload` (the raw message value from Kafka).
+    *   **Output:** `Optional<DataTransferObject>` containing the DTO if successful, `Optional.empty()` otherwise.
+    *   **Logic:**
+        1.  Initialize Jackson `ObjectMapper`.
+        2.  Try to deserialize `jsonPayload` into a temporary map or directly into `DataTransferObject`.
+        3.  Perform any necessary validation (e.g., check for required fields).
+        4.  If valid, construct and return `Optional.of(dto)`.
+        5.  Catch `JsonProcessingException` or validation errors, log appropriately (at WARN or ERROR level), and return `Optional.empty()`.
+    ```java
+    package com.example.processor.transform;
+
+    import com.example.processor.dto.DataTransferObject;
+    import com.fasterxml.jackson.core.JsonProcessingException;
+    import com.fasterxml.jackson.databind.ObjectMapper;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+
+    import java.util.Optional;
+
+    public class MessageTransformer {
+        private static final Logger log = LoggerFactory.getLogger(MessageTransformer.class);
+        private final ObjectMapper objectMapper = new ObjectMapper(); // Thread-safe
+
+        /**
+         * Transforms a JSON string payload into a DataTransferObject.
+         * This is a pure function assuming objectMapper is configured consistently.
+         * @param jsonPayload The input JSON string.
+         * @return Optional containing the DTO if transformation is successful, empty otherwise.
+         */
+        public Optional<DataTransferObject> transform(String jsonPayload) {
+            if (jsonPayload == null || jsonPayload.isEmpty()) {
+                log.warn("Received null or empty payload.");
+                return Optional.empty();
+            }
+            try {
+                // Assuming DTO has appropriate constructor or Jackson annotations
+                DataTransferObject dto = objectMapper.readValue(jsonPayload, DataTransferObject.class);
+
+                // Add any additional validation logic here if needed
+                if (dto.getId() == null || dto.getId().isEmpty()) {
+                     log.warn("Validation failed: ID is missing in payload: {}", jsonPayload);
+                     return Optional.empty();
+                }
+
+                return Optional.of(dto);
+            } catch (JsonProcessingException e) {
+                log.error("Failed to parse JSON payload: {}", jsonPayload, e);
+                return Optional.empty();
+            } catch (Exception e) { // Catch potential validation errors or other issues
+                log.error("Failed to transform payload: {}", jsonPayload, e);
+                return Optional.empty();
+            }
+        }
+    }
+    ```
+*   **FP Principles:**
+    *   **Pure Function:** Given the same input string, `transform` always produces the same `Optional<DataTransferObject>` output without causing side effects (logging is a managed side effect, ideally separated further if extreme purity is needed, but acceptable here).
+    *   **Immutability:** Takes string, produces immutable DTO.
+    *   **Declarative:** Returns `Optional` to clearly signal success or failure without resorting to nulls or exceptions for control flow.
+
+**4.5. Module: `CassandraRepository.java`**
+
+*   **Purpose:** Handles interaction with Cassandra.
+*   **Implementation:**
+    ```java
+    package com.example.processor.persistence;
+
+    import com.datastax.oss.driver.api.core.ConsistencyLevel;
+    import com.datastax.oss.driver.api.core.CqlSession;
+    import com.datastax.oss.driver.api.core.cql.*;
+    import com.datastax.oss.driver.api.core.servererrors.*;
+    import com.example.processor.config.AppConfig;
+    import com.example.processor.dto.DataTransferObject;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+
+    import java.net.InetSocketAddress;
+    import java.util.Collections;
+    import java.util.List;
+    import java.util.stream.Collectors;
+    import java.util.stream.Stream;
+
+    public class CassandraRepository implements AutoCloseable {
+        private static final Logger log = LoggerFactory.getLogger(CassandraRepository.class);
+
+        private final CqlSession session;
+        private final PreparedStatement insertStatement;
+        private final String keyspace;
+        private final String table;
+
+        public CassandraRepository(AppConfig config) {
+            this.keyspace = config.getCassandraKeyspace();
+            this.table = config.getCassandraTable();
+            String contactPointsStr = config.getCassandraContactPoints();
+            int port = config.getCassandraPort();
+            String localDc = config.getCassandraLocalDc();
+
+            List<InetSocketAddress> contactPoints = Stream.of(contactPointsStr.split(","))
+                    .map(String::trim)
+                    .map(host -> new InetSocketAddress(host, port))
+                    .collect(Collectors.toList());
+
+            this.session = CqlSession.builder()
+                    .addContactPoints(contactPoints)
+                    .withLocalDatacenter(localDc) // Crucial for driver optimization and policy routing
+                    .withKeyspace(this.keyspace)
+                    // Add auth provider if needed: .withAuthCredentials("user", "password")
+                    .build();
+
+            // Prepare statement for efficiency
+            this.insertStatement = session.prepare(
+                String.format("INSERT INTO %s.%s (id, payload_data, timestamp) VALUES (?, ?, ?)",
+                              keyspace, table)
+            );
+            log.info("CassandraRepository initialized. Connected to keyspace '{}', table '{}'", keyspace, table);
+        }
+
+        /**
+         * Saves the DTO to Cassandra with QUORUM consistency.
+         * This function has side effects (database write).
+         * @param dto The DataTransferObject to persist.
+         * @throws CassandraWriteException If the write operation fails after potential retries by the driver.
+         */
+        public void save(DataTransferObject dto) throws CassandraWriteException {
+            log.debug("Attempting to save DTO with id: {}", dto.getId());
+            BoundStatement boundStatement = insertStatement.bind(
+                    dto.getId(),
+                    dto.getPayloadData(),
+                    dto.getTimestamp()
+            ).setConsistencyLevel(ConsistencyLevel.QUORUM); // Explicitly set QUORUM
+
+            try {
+                ResultSet resultSet = session.execute(boundStatement);
+                // Optionally check resultSet.wasApplied() if using LWT (like IF NOT EXISTS)
+                log.debug("Successfully saved DTO with id: {}", dto.getId());
+            } catch (UnavailableException e) {
+                log.error("Cassandra Write Failed (Unavailable): Not enough replicas available for QUORUM. Needed {}, Got {}. DTO ID: {}", e.getRequired(), e.getAlive(), dto.getId(), e);
+                throw new CassandraWriteException("Write failed: Not enough replicas available for QUORUM.", e);
+            } catch (WriteTimeoutException e) {
+                 log.error("Cassandra Write Failed (Timeout): QUORUM consistency level not met within timeout. Type: {}. DTO ID: {}", e.getWriteType(), dto.getId(), e);
+                throw new CassandraWriteException("Write failed: Timeout waiting for QUORUM acknowledgement.", e);
+            } catch (WriteFailureException e) {
+                log.error("Cassandra Write Failed (Failure): Write failed on some replicas. Reason: {}. DTO ID: {}", e.getReasonMap(), dto.getId(), e);
+                throw new CassandraWriteException("Write failed on some replicas.", e);
+            } catch (Exception e) { // Catch other potential driver/network issues
+                log.error("Cassandra Write Failed (Generic): DTO ID: {}", dto.getId(), e);
+                throw new CassandraWriteException("An unexpected error occurred during Cassandra write.", e);
+            }
+        }
+
+        /**
+         * Performs a simple query to check connectivity. Used for health checks.
+         * @return true if the query succeeds, false otherwise.
+         */
+        public boolean checkConnectivity() {
+             try {
+                 // Use a lightweight, standard query
+                 session.execute("SELECT release_version FROM system.local");
+                 return true;
+             } catch (Exception e) {
+                 log.warn("Cassandra connectivity check failed.", e);
+                 return false;
+             }
+        }
+
+        @Override
+        public void close() {
+            if (session != null && !session.isClosed()) {
+                log.info("Closing Cassandra session.");
+                session.close();
+            }
+        }
+
+        // Custom exception for clarity
+        public static class CassandraWriteException extends RuntimeException {
+            public CassandraWriteException(String message, Throwable cause) {
+                super(message, cause);
+            }
+        }
+    }
+    ```
+*   **FP Principles:**
+    *   **Side Effect Isolation:** The `save` method clearly performs a side effect (writing to Cassandra). It's separated from pure transformation logic.
+    *   **Error Handling:** Explicitly catches relevant Cassandra exceptions and wraps them, making failure modes clearer to the caller (the Kafka Streams topology).
+
+**4.6. Module: `TopologyBuilder.java`**
+
+*   **Purpose:** Define the Kafka Streams processing logic.
+*   **Implementation:**
+    ```java
+    package com.example.processor.kafka;
+
+    import com.example.processor.config.AppConfig;
+    import com.example.processor.dto.DataTransferObject;
+    import com.example.processor.persistence.CassandraRepository;
+    import com.example.processor.transform.MessageTransformer;
+    import org.apache.kafka.common.serialization.Serdes;
+    import org.apache.kafka.streams.StreamsBuilder;
+    import org.apache.kafka.streams.Topology;
+    import org.apache.kafka.streams.kstream.*;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+
+    // Custom Serde for DataTransferObject (using JSON)
+    import com.example.processor.kafka.serdes.JsonSerde; // You'll need to implement this
+
+    public class TopologyBuilder {
+
+        private static final Logger log = LoggerFactory.getLogger(TopologyBuilder.class);
+
+        private final AppConfig config;
+        private final MessageTransformer transformer;
+        private final CassandraRepository cassandraRepository;
+
+        public TopologyBuilder(AppConfig config, MessageTransformer transformer, CassandraRepository cassandraRepository) {
+            this.config = config;
+            this.transformer = transformer;
+            this.cassandraRepository = cassandraRepository;
+        }
+
+        public Topology build() {
+            StreamsBuilder builder = new StreamsBuilder();
+
+            // 1. Consume from source topic
+            KStream<String, String> sourceStream = builder.stream(
+                    config.getSourceTopic(),
+                    Consumed.with(Serdes.String(), Serdes.String())
+            );
+
+            // 2. Transform message payload to DTO (Pure function call)
+            KStream<String, DataTransferObject> transformedStream = sourceStream
+                .mapValues(value -> transformer.transform(value).orElse(null)) // Use pure transform func
+                .filter((key, value) -> { // Filter out messages that failed transformation
+                    if (value == null) {
+                        log.warn("Dropping message with key [{}] due to transformation failure.", key);
+                        // Consider sending to a dead-letter queue (DLQ) here instead of just dropping
+                        return false;
+                    }
+                    return true;
+                });
+
+            // 3. Persist DTO to Cassandra (Side effect)
+            // Use process() for better error handling and access to ProcessorContext
+            transformedStream.process(() -> new CassandraWriterProcessor(cassandraRepository));
+
+            // 4. Produce DTO to sink topic (Side effect)
+            // Need a Serde for DataTransferObject
+            transformedStream.to(
+                config.getSinkTopic(),
+                Produced.with(Serdes.String(), new JsonSerde<>(DataTransferObject.class)) // Use your DTO Serde
+            );
+
+            return builder.build();
+        }
+
+         // Processor implementation for robust Cassandra writes within the topology
+        private static class CassandraWriterProcessor extends AbstractProcessor<String, DataTransferObject> {
+            private final CassandraRepository repository;
+
+            public CassandraWriterProcessor(CassandraRepository repository) {
+                this.repository = repository;
+            }
+
+            @Override
+            public void process(String key, DataTransferObject dto) {
+                try {
+                    repository.save(dto);
+                    // Optionally: context().forward(key, dto); // if further processing needed downstream *within KStreams*
+                } catch (CassandraRepository.CassandraWriteException e) {
+                    // Decide how to handle Cassandra write failures within EOS context
+                    // Option 1: Log and drop (data written to sink topic but not DB) - Breaks consistency goal
+                    // Option 2: Throw an exception to trigger KStreams shutdown/retry mechanism
+                    log.error("FATAL: Failed to write DTO key [{}] to Cassandra. Triggering KStreams exception.", key, e);
+                    // This exception should cause the KStream app to shut down if not handled by an exception handler
+                    // configured on the KafkaStreams instance. EOS ensures the source offset isn't committed.
+                    throw new RuntimeException("Failed to persist data to Cassandra for key " + key, e);
+                    // Option 3: Implement retry logic *within* the processor (careful with EOS timeouts)
+                    // Option 4: Send to a separate DLQ topic for manual intervention
+                } catch (Exception e) {
+                    log.error("FATAL: Unexpected error during Cassandra persistence for key [{}]. Triggering KStreams exception.", key, e);
+                    throw new RuntimeException("Unexpected error persisting data to Cassandra for key " + key, e);
+                }
+            }
+        }
+        // Note: JsonSerde implementation needed (wraps Jackson ObjectMapper)
+    }
+    ```
+*   **FP Principles:**
+    *   **Declarative Style:** Kafka Streams DSL provides a high-level, declarative way to define the stream processing flow.
+    *   **Function Composition:** The flow `consume -> transform -> filter -> persist -> produce` chains operations.
+    *   **Pure Function Usage:** Uses the pure `MessageTransformer::transform` within `mapValues`.
+    *   **Side Effect Isolation:** Cassandra persistence (`CassandraWriterProcessor::process`) and Kafka production (`.to()`) are distinct steps clearly marked as having side effects. The use of `process` encapsulates the side effect logic related to Cassandra persistence, improving separation. Error handling within the processor is critical for EOS.
+
+**4.7. Module: `StreamProcessorApp.java`**
+
+*   **Purpose:** Main application entry point, initializes and manages resources.
+*   **Implementation:**
+    ```java
+    package com.example.processor;
+
+    import com.example.processor.config.AppConfig;
+    import com.example.processor.health.HealthCheckServer;
+    import com.example.processor.kafka.TopologyBuilder;
+    import com.example.processor.persistence.CassandraRepository;
+    import com.example.processor.transform.MessageTransformer;
+    import org.apache.kafka.clients.consumer.ConsumerConfig;
+    import org.apache.kafka.streams.KafkaStreams;
+    import org.apache.kafka.streams.StreamsConfig;
+    import org.apache.kafka.streams.Topology;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+
+    import java.util.Properties;
+    import java.util.concurrent.CountDownLatch;
+
+    public class StreamProcessorApp {
+
+        private static final Logger log = LoggerFactory.getLogger(StreamProcessorApp.class);
+        private static final String CONFIG_PATH_ENV_VAR = "CONFIG_PATH";
+        private static final String DEFAULT_CONFIG_PATH = "/config/application.properties"; // Default path inside container
+
+        public static void main(String[] args) {
+            String configPath = System.getenv(CONFIG_PATH_ENV_VAR);
+            if (configPath == null || configPath.isEmpty()) {
+                configPath = DEFAULT_CONFIG_PATH;
+                log.info("Environment variable {} not set, using default config path: {}", CONFIG_PATH_ENV_VAR, DEFAULT_CONFIG_PATH);
+            } else {
+                 log.info("Loading configuration from: {}", configPath);
+            }
+
+            KafkaStreams streams = null;
+            CassandraRepository cassandraRepository = null;
+            HealthCheckServer healthCheckServer = null;
+
+            try {
+                // 1. Load Configuration
+                AppConfig config = new AppConfig(configPath);
+
+                // 2. Initialize Components
+                MessageTransformer transformer = new MessageTransformer();
+                cassandraRepository = new CassandraRepository(config); // Manages its own CqlSession
+
+                // 3. Build Kafka Streams Topology
+                TopologyBuilder topologyBuilder = new TopologyBuilder(config, transformer, cassandraRepository);
+                Topology topology = topologyBuilder.build();
+                log.info("Kafka Streams Topology:\n{}", topology.describe());
+
+                // 4. Configure Kafka Streams Properties
+                Properties props = new Properties();
+                props.put(StreamsConfig.APPLICATION_ID_CONFIG, config.getApplicationId());
+                props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, config.getKafkaBootstrapServers());
+                props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, org.apache.kafka.common.serialization.Serdes.String().getClass().getName());
+                props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, org.apache.kafka.common.serialization.Serdes.String().getClass().getName());
+                props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2); // Enable EOS
+                props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000); // Adjust commit interval as needed
+                // Required for EOS V2 - Broker must be >= 2.5
+                props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+
+                // Add other configs (num.stream.threads, security, etc.) from AppConfig if needed
+
+                // 5. Initialize and Start Kafka Streams
+                streams = new KafkaStreams(topology, props);
+
+                // Add shutdown hook for graceful closure
+                final CountDownLatch latch = new CountDownLatch(1);
+                KafkaStreams finalStreams = streams; // Need final variable for lambda
+                CassandraRepository finalCassandraRepository = cassandraRepository; // Need final for lambda
+                Runtime.getRuntime().addShutdownHook(new Thread("streams-shutdown-hook") {
+                    @Override
+                    public void run() {
+                        log.info("Shutdown hook initiated...");
+                        if (finalStreams != null) {
+                            finalStreams.close(); // Closes streams, producers, consumers
+                        }
+                        if (finalCassandraRepository != null) {
+                            finalCassandraRepository.close(); // Close Cassandra session
+                        }
+                        // Health check server shutdown handled in its own try-with-resources or explicit stop
+                        latch.countDown();
+                        log.info("Shutdown complete.");
+                    }
+                });
+
+                 // 6. Start Health Check Server (after other components are potentially ready)
+                healthCheckServer = new HealthCheckServer(config, streams, cassandraRepository);
+                healthCheckServer.start(); // Start in background thread
+
+                // 7. Start Processing
+                streams.start();
+                log.info("Kafka Streams application started.");
+                latch.await(); // Wait until shutdown hook finishes
+
+            } catch (Throwable e) { // Catch fatal errors during startup
+                log.error("Application failed to start.", e);
+                // Ensure resources are closed even on startup failure
+                if (streams != null) streams.close();
+                if (cassandraRepository != null) cassandraRepository.close();
+                if (healthCheckServer != null) healthCheckServer.stop(); // Assuming a stop method
+                System.exit(1); // Exit with error code
+            }
+             System.exit(0); // Normal exit after latch countdown
+        }
+    }
+    ```
+*   **FP Principles:** While the main method is inherently procedural and deals with side effects (starting servers, threads), it orchestrates components that adhere to FP principles where applicable (like using the pure transformer). Resource management uses try-with-resources or explicit close in shutdown hooks.
+
+**4.8. Module: `HealthCheckServer.java`**
+
+*   **Purpose:** Provide `/health` endpoint.
+*   **Implementation:** Use `com.sun.net.httpserver` for simplicity.
+    ```java
+    package com.example.processor.health;
+
+    import com.example.processor.config.AppConfig;
+    import com.example.processor.persistence.CassandraRepository;
+    import com.sun.net.httpserver.HttpServer;
+    import org.apache.kafka.streams.KafkaStreams;
+    import org.apache.kafka.streams.KafkaStreams.State;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+
+    import java.io.IOException;
+    import java.io.OutputStream;
+    import java.net.InetSocketAddress;
+    import java.util.EnumSet;
+
+    public class HealthCheckServer {
+        private static final Logger log = LoggerFactory.getLogger(HealthCheckServer.class);
+        private final HttpServer server;
+        private final KafkaStreams streams;
+        private final CassandraRepository cassandraRepository;
+
+        // Healthy states for Kafka Streams
+        private static final EnumSet<State> HEALTHY_STATES = EnumSet.of(
+                State.RUNNING, State.REBALANCING, State.CREATED // Consider CREATED if startup is slow
+        );
+
+        public HealthCheckServer(AppConfig config, KafkaStreams streams, CassandraRepository cassandraRepository) throws IOException {
+            this.streams = streams;
+            this.cassandraRepository = cassandraRepository;
+            int port = config.getHealthCheckPort();
+            this.server = HttpServer.create(new InetSocketAddress(port), 0);
+            this.server.createContext("/health", exchange -> {
+                boolean kafkaHealthy = isKafkaStreamsHealthy();
+                boolean cassandraHealthy = isCassandraHealthy();
+                int statusCode = (kafkaHealthy && cassandraHealthy) ? 200 : 503; // OK or Service Unavailable
+                String response = String.format("{\"status\": \"%s\", \"kafkaStreams\": \"%s\", \"cassandra\": \"%s\"}\n",
+                        (statusCode == 200 ? "UP" : "DOWN"),
+                        (kafkaHealthy ? "HEALTHY" : "UNHEALTHY (" + streams.state() + ")"),
+                        (cassandraHealthy ? "HEALTHY" : "UNHEALTHY"));
+
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(statusCode, response.getBytes().length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(response.getBytes());
+                }
+            });
+            this.server.setExecutor(null); // Use default executor
+            log.info("Health check server configured on port {}", port);
+        }
+
+        private boolean isKafkaStreamsHealthy() {
+            // Check if streams object exists and is in a running/rebalancing state
+            return streams != null && HEALTHY_STATES.contains(streams.state());
+        }
+
+         private boolean isCassandraHealthy() {
+             // Check if repository exists and can connect
+             return cassandraRepository != null && cassandraRepository.checkConnectivity();
+         }
+
+        public void start() {
+            log.info("Starting health check server...");
+            server.start();
+        }
+
+        public void stop() {
+             log.info("Stopping health check server...");
+             server.stop(0); // Stop immediately
+        }
+    }
+    ```
+*   **FP Principles:** The checking logic (`isKafkaStreamsHealthy`, `isCassandraHealthy`) can be seen as predicates (functions returning boolean). The server itself is stateful.
+
+**4.9. JMX Exporter Configuration (`jmx_exporter_config.yaml`)**
+
+*   **Purpose:** Configure the Prometheus JMX Exporter agent.
+*   **Implementation:** A YAML file specifying MBeans and attributes to expose.
+    ```yaml
+    ---
+    # Example config - Adjust based on specific metrics needed
+    startDelaySeconds: 0
+    ssl: false
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Kafka Streams Client Metrics (adjust domain/beans based on version)
+      - pattern: "kafka.streams<type=stream-metrics, client-id=(.+)><>(.+):"
+        name: kafka_streams_stream_metrics_$2
+        labels:
+          clientId: "$1"
+      - pattern: "kafka.consumer<type=consumer-fetch-manager-metrics, client-id=(.+)><>(.+):"
+        name: kafka_consumer_fetch_manager_metrics_$2
+        labels:
+          clientId: "$1"
+      - pattern: "kafka.producer<type=producer-metrics, client-id=(.+)><>(.+):"
+        name: kafka_producer_metrics_$2
+        labels:
+          clientId: "$1"
+
+      # DataStax Java Driver Metrics (replace 'your-app-name' with actual session name if customized)
+      # May need adjustment based on driver version and configuration
+      - pattern: "com.datastax.oss.driver.metrics<session=your-app-name-session, type=session, name=(bytes-sent|bytes-received)><>Count"
+        name: cassandra_driver_session_bytes_total
+        labels:
+          direction: "$1"
+        type: COUNTER
+      - pattern: "com.datastax.oss.driver.metrics<session=your-app-name-session, type=session, name=connected-nodes><>Value"
+        name: cassandra_driver_session_connected_nodes
+        type: GAUGE
+      - pattern: "com.datastax.oss.driver.metrics<session=your-app-name-session, type=node, node=(\\S+), name=cql-requests><>Count"
+        name: cassandra_driver_node_cql_requests_seconds_count # Micrometer Timer 'count' part
+        labels:
+          node: "$1"
+        type: COUNTER
+      - pattern: "com.datastax.oss.driver.metrics<session=your-app-name-session, type=node, node=(\\S+), name=cql-requests><>Mean"
+        name: cassandra_driver_node_cql_requests_seconds_mean # Micrometer Timer 'mean' part (in seconds)
+        labels:
+          node: "$1"
+        type: GAUGE # Mean is gauge-like
+      # Add more patterns for timeouts, errors, pool state etc. as needed
+    ```
+    *(Note: Finding the exact MBean names for the DataStax driver might require inspecting JMX via JConsole/VisualVM or checking the driver's documentation for Micrometer tags)*
+
+**5. Test Scenarios (No Mocking, Docker Compose)**
+
+**5.1. Test Setup (`docker-compose.test.yml`)**
+
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.8
+    container_name: test-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - testnet
+
+  kafka:
+    image: confluentinc/cp-server:7.5.8 # Use cp-server for full features if needed, else cp-kafka
+    container_name: test-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092" # Expose for test client access from host if needed, otherwise just within network
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092 # Internal and optional external
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Confluent specific license acceptance might be needed depending on exact image/features used
+      CONFLUENT_SUPPORT_CUSTOMER_ID: 'anonymous'
+      CONFLUENT_BOOTSTRAP_SERVERS: kafka:19092
+      CONFLUENT_METRICS_ENABLE: 'false' # Disable metrics reporter unless testing it
+      # KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092,PLAINTEXT_HOST://0.0.0.0:9092 # Correct way to bind
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:19092 # Internal listener
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092 # How other containers reach it
+    networks:
+      - testnet
+
+  cassandra:
+    image: datastax/dse-server:6.8.9
+    container_name: test-cassandra
+    environment:
+      - DS_LICENSE=accept
+      - CASSANDRA_START_RPC=true # Enable Thrift if needed by tools, usually not for driver
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch # Simple snitch for single node
+      - CASSANDRA_DC=testdc # Define a datacenter name
+      - CASSANDRA_RACK=testrack # Define a rack name
+    ports:
+      - "9042:9042" # Expose C* port
+    networks:
+      - testnet
+    # Add healthcheck if needed, wait for cqlsh readiness
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 12 # Wait up to 2 minutes
+
+  # Optional: Service to run setup scripts
+  setup-resources:
+    image: confluentinc/cp-server:7.5.8 # Has kafka-topics tool
+    container_name: setup-resources
+    depends_on:
+      kafka:
+        condition: service_started # Basic check, Kafka might not be fully ready
+      cassandra:
+        condition: service_healthy # Wait for Cassandra healthcheck
+    networks:
+      - testnet
+    volumes:
+      - ./scripts:/scripts # Mount local scripts directory
+      # Mount cqlsh binary/libs or use an image with it if cp-server doesn't have it easily accessible
+      # - type: bind # Example if using separate cqlsh tool container image
+      #   source: ./path/to/cqlsh # Might be complex
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka broker...' &&
+        cub wait-for-kafka --bootstrap-server kafka:19092 --timeout 120 &&
+        echo 'Creating Kafka topics...' &&
+        /scripts/create_kafka_topics.sh kafka:19092 &&
+        echo 'Waiting for Cassandra...' &&
+        # Simple wait, refine if needed
+        sleep 15 &&
+        echo 'Setting up Cassandra schema...' &&
+        # Need cqlsh available here. If not in cp-server, use a different image or install it.
+        # Assuming cqlsh is available for now:
+        cqlsh test-cassandra 9042 -f /scripts/schema.cql &&
+        echo 'Setup complete.'
+      "
+    # Note: Using 'cub wait-for-kafka' from confluent utils.
+    # Note: Assumes cqlsh is available in the chosen image or installed. DSE image itself has it. Might need a separate container for cqlsh.
+
+  # Test runner or App under test - depends on how tests are executed
+  # Example: Running JUnit tests from a container
+  # test-runner:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.test # A Dockerfile specific for running tests
+  #   container_name: test-runner
+  #   depends_on:
+  #     kafka:
+  #       condition: service_started
+  #     cassandra:
+  #       condition: service_healthy
+  #     setup-resources:
+  #       condition: service_completed_successfully # Ensure setup finishes
+  #   networks:
+  #     - testnet
+  #   environment:
+  #     # Pass necessary connection details for the test framework
+  #     KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+  #     CASSANDRA_CONTACT_POINTS: cassandra # Service name
+  #     CASSANDRA_PORT: 9042
+  #     CASSANDRA_LOCAL_DC: testdc
+  #     CASSANDRA_KEYSPACE: test_app_keyspace # Use a dedicated test keyspace
+  #     # Other test parameters
+  #   command: ["mvn", "test", "-Pintegration-test"] # Example command
+
+networks:
+  testnet:
+
+```
+*(Note: The `setup-resources` service is one way to handle initialization. Test frameworks like Testcontainers offer alternative, integrated approaches.)*
+
+**5.2. Test Scenarios for `MessageTransformer.transform`**
+
+*   **Context:** These are unit tests but can be run within the Docker Compose context for consistency if desired (though not strictly necessary as it's pure).
+*   **Scenario T1: Valid JSON Input**
+    *   **Setup:** Create `MessageTransformer` instance. Define valid JSON string `{"id": "uuid-1", "payloadData": "some info", "timestamp": 1678886400000}`.
+    *   **Execution:** Call `transformer.transform(validJson)`.
+    *   **Assertion:** Assert the returned `Optional` is present. Assert the contained `DataTransferObject` has `id="uuid-1"`, `payloadData="some info"`, `timestamp=1678886400000`.
+*   **Scenario T2: Invalid JSON Input**
+    *   **Setup:** Create `MessageTransformer`. Define invalid JSON `{"id": "uuid-2", "payloadData": }`.
+    *   **Execution:** Call `transformer.transform(invalidJson)`.
+    *   **Assertion:** Assert the returned `Optional` is empty. Verify logs show an error message.
+*   **Scenario T3: Missing Required Field (e.g., ID)**
+    *   **Setup:** Create `MessageTransformer`. Define JSON `{"payloadData": "more info", "timestamp": 1678886400001}` (missing `id`).
+    *   **Execution:** Call `transformer.transform(missingFieldJson)`.
+    *   **Assertion:** Assert the returned `Optional` is empty (due to validation logic in `transform`). Verify logs show a warning/error.
+
+**5.3. Test Scenarios for `CassandraRepository.save` (Integration)**
+
+*   **Context:** These tests require the `cassandra` service from `docker-compose.test.yml` to be running and the schema (`test_app_keyspace`, `test_data_table`) to be created (e.g., by `setup-resources` or test setup method).
+*   **Prerequisite:** Test code needs a `CqlSession` connected to `test-cassandra:9042` within the `testnet` network. Keyspace `test_app_keyspace` and table `test_data_table` must exist.
+*   **Scenario CR1: Successful Save (QUORUM)**
+    *   **Setup:**
+        1.  Instantiate `CassandraRepository` pointing to the test Cassandra container (`cassandra:9042`, `testdc`).
+        2.  Create a `DataTransferObject dto = new DataTransferObject("cr1-id", "data1", System.currentTimeMillis());`.
+        3.  Ensure the table is empty for this ID.
+    *   **Execution:** Call `cassandraRepository.save(dto)`.
+    *   **Assertion:**
+        1.  Using a separate `CqlSession` in the test, execute `SELECT id, payload_data, timestamp FROM test_app_keyspace.test_data_table WHERE id = 'cr1-id'`.
+        2.  Verify that one row is returned.
+        3.  Assert the returned row's columns match the `dto`'s values.
+*   **Scenario CR2: Attempt to Save Duplicate Primary Key**
+    *   **Setup:**
+        1.  Instantiate `CassandraRepository`.
+        2.  Create `DataTransferObject dto1 = new DataTransferObject("cr2-id", "data2a", System.currentTimeMillis());`.
+        3.  Call `cassandraRepository.save(dto1)` to insert the first record.
+        4.  Create `DataTransferObject dto2 = new DataTransferObject("cr2-id", "data2b", System.currentTimeMillis() + 1000);` (same ID, different data).
+    *   **Execution:** Call `cassandraRepository.save(dto2)`.
+    *   **Assertion:**
+        1.  Verify that the `save` method *completes without throwing an exception* (standard INSERT overwrites).
+        2.  Using a separate `CqlSession`, execute `SELECT payload_data FROM test_app_keyspace.test_data_table WHERE id = 'cr2-id'`.
+        3.  Assert the returned `payload_data` is `"data2b"` (the latest write). *(Note: If `IF NOT EXISTS` were used in `save`, the assertion would be that the data remains `"data2a"`).*
+
+**5.4. Test Scenarios for Full Stream Processor (End-to-End Integration)**
+
+*   **Context:** Requires `zookeeper`, `kafka`, `cassandra`, and `setup-resources` services from `docker-compose.test.yml` to be running and initialized. The test framework needs Kafka clients (Producer, Consumer) and a `CqlSession`.
+*   **Scenario E2E1: Valid Message Processing**
+    *   **Setup:**
+        1.  Start the Stream Processor application itself (either as another container `app-under-test` defined in compose, or run its main method configured to connect to the test cluster). Ensure it reaches a RUNNING state.
+        2.  Instantiate test Kafka Producer connected to `kafka:19092` (internal listener).
+        3.  Instantiate test Kafka Consumer subscribed to `sink_topic` (using `kafka:19092`).
+        4.  Instantiate test `CqlSession` connected to `cassandra:9042`.
+        5.  Define input JSON: `String inputJson = "{\"id\": \"e2e1-id\", \"payloadData\": \"e2e-data\", \"timestamp\": 1678888000000}";`
+        6.  Ensure no data exists in Cassandra for `id='e2e1-id'`.
+        7.  Ensure no relevant message is already in `sink_topic`.
+    *   **Execution:**
+        1.  Use the test Kafka Producer to send `inputJson` to `source_topic`.
+    *   **Assertion:**
+        1.  **Cassandra:** Use the test `CqlSession` to query `test_app_keyspace.test_data_table` for `id='e2e1-id'`. Assert that a record exists within a reasonable timeout (e.g., 10-20 seconds) and its `payload_data` is `"e2e-data"` and `timestamp` is `1678888000000`.
+        2.  **Kafka Sink:** Use the test Kafka Consumer to poll `sink_topic`. Assert that a message is received within a reasonable timeout. Deserialize its value (using `JsonSerde` or similar) and verify its fields match the expected `DataTransferObject` (`id="e2e1-id"`, etc.).
+*   **Scenario E2E2: Invalid Message Format**
+    *   **Setup:** Same as E2E1, but define `inputJson = "{\"id\": \"e2e2-id\", payloadData\" : \"malformed\"}";` (invalid JSON). Ensure test consumer/Cassandra are clean for this ID.
+    *   **Execution:** Send `inputJson` to `source_topic`.
+    *   **Assertion:**
+        1.  **Cassandra:** Query Cassandra for `id='e2e2-id'`. Assert that *no record* is found after a timeout.
+        2.  **Kafka Sink:** Poll `sink_topic`. Assert that *no message* related to `e2e2-id` is received after a timeout.
+        3.  **Logs (Optional):** Check the application logs (if accessible from the test) for warnings/errors indicating transformation failure and message dropping for `e2e2-id`.
+*   **Scenario E2E3: Cassandra Write Failure (Simulated - Difficult without Chaos Engineering)**
+    *   **Note:** Simulating a transient Cassandra failure (like `UnavailableException`) perfectly within the EOS transaction boundary is complex in a simple Docker Compose setup. A common approach is to test the *handling* logic assuming a failure occurs.
+    *   **Conceptual Test:**
+        1.  Modify the `CassandraRepository.save` method temporarily (for this test only) to *always* throw a `CassandraWriteException`.
+        2.  Run the E2E1 scenario setup and execution.
+    *   **Assertion (based on chosen failure strategy in `CassandraWriterProcessor`):**
+        *   If strategy is "throw exception": Assert that the Kafka Streams application state becomes `ERROR` or shuts down. Assert that the source topic offset for the failed message was *not* committed (check consumer group offsets). Assert no data in Cassandra and no message in sink topic for this ID.
+        *   If strategy is "DLQ": Assert no data in Cassandra, no message in sink topic, but a message *is* present in the designated DLQ topic.
+
+**6. Dockerization**
+
+**6.1. `Dockerfile`**
+
+```dockerfile
+# Stage 1: Build the application using Maven
+FROM maven:3.8.4-openjdk-17 AS builder
+WORKDIR /app
+COPY pom.xml .
+# Download dependencies first for better layer caching
+RUN mvn dependency:go-offline -B
+COPY src ./src
+# Build the application and package it
+RUN mvn package -DskipTests
+
+# Stage 2: Create the final runtime image
+# Use a minimal JRE base image
+FROM eclipse-temurin:17-jre-focal
+WORKDIR /app
+
+# Define arguments for configuration
+ARG JMX_EXPORTER_PORT=7071
+ARG JMX_CONFIG=/app/jmx_exporter_config.yaml
+ARG AGENT_PATH=/app/jmx_prometheus_javaagent.jar
+
+# Copy necessary artifacts from the builder stage
+COPY --from=builder /app/target/kafka-cassandra-processor-*.jar ./app.jar
+# Add JMX Exporter agent JAR (download or copy from a known location)
+# Example: Assuming you download it separately or have it locally
+COPY jmx_prometheus_javaagent-*.jar $AGENT_PATH
+COPY jmx_exporter_config.yaml $JMX_CONFIG
+
+# Copy scripts into the image (optional, could be mounted)
+COPY scripts ./scripts
+
+# Expose ports (Health Check, JMX Exporter)
+EXPOSE 8080 ${JMX_EXPORTER_PORT} # Assuming default 8080 for health
+
+# Set the entrypoint to run the application
+# Pass JMX agent config via JAVA_OPTS for flexibility
+# Pass config path via environment variable
+ENV CONFIG_PATH="/config/application.properties"
+ENV JAVA_OPTS="-javaagent:${AGENT_PATH}=${JMX_EXPORTER_PORT}:${JMX_CONFIG}"
+
+# Run the application JAR
+ENTRYPOINT ["java", "-server", "-XX:+UseG1GC"]
+CMD ${JAVA_OPTS} -Dlog4j.configurationFile=log4j2.xml -jar app.jar
+# Note: Add -Dlog4j.configurationFile if log4j2.xml is not in default classpath location
+
+# Add Healthcheck instruction
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# Define a default config volume mount point
+VOLUME /config
+```
+
+**6.2. Configuration File (`config/application.properties`)**
+
+```properties
+# Kafka Configuration
+kafka.bootstrap.servers=kafka:19092 # Use internal Docker network hostname
+kafka.topic.source=source_topic
+kafka.topic.sink=sink_topic
+kafka.streams.application.id=kafka-cassandra-processor-prod
+# Ensure EOS config is here or hardcoded in StreamProcessorApp if not changing
+# kafka.streams.processing.guarantee=exactly_once_v2
+
+# Cassandra Configuration
+cassandra.contact-points=cassandra # Use internal Docker network hostname
+cassandra.port=9042
+cassandra.local-datacenter=datacenter1 # MUST match Cassandra config in docker-compose.yml
+cassandra.keyspace=app_keyspace
+cassandra.table=data_table
+# Add Cassandra auth credentials if needed:
+# cassandra.auth.username=user
+# cassandra.auth.password=pass
+
+# Application Configuration
+health.check.port=8080
+# JMX Exporter port is configured via Dockerfile ARG/ENV and Agent parameter
+```
+
+**7. Setup Scripts & Deployment Strategy**
+
+**7.1. `scripts/create_kafka_topics.sh`**
+
+```bash
+#!/bin/bash
+
+BROKER_LIST=$1
+SOURCE_TOPIC=${SOURCE_TOPIC:-source_topic} # Use env var or default
+SINK_TOPIC=${SINK_TOPIC:-sink_topic}     # Use env var or default
+PARTITIONS=${PARTITIONS:-3}              # Example: default to 3 partitions
+REPLICATION=${REPLICATION:-1}          # Set based on cluster size (1 for single node test)
+
+if [ -z "$BROKER_LIST" ]; then
+  echo "Usage: $0 <kafka-broker-list>"
+  echo "Example: $0 kafka:19092"
+  exit 1
+fi
+
+echo "Using Kafka Broker list: $BROKER_LIST"
+echo "Source Topic: $SOURCE_TOPIC, Sink Topic: $SINK_TOPIC"
+echo "Partitions: $PARTITIONS, Replication Factor: $REPLICATION"
+
+# Create source topic if it doesn't exist
+kafka-topics --bootstrap-server $BROKER_LIST --create --if-not-exists \
+  --topic $SOURCE_TOPIC --partitions $PARTITIONS --replication-factor $REPLICATION
+
+# Create sink topic if it doesn't exist
+kafka-topics --bootstrap-server $BROKER_LIST --create --if-not-exists \
+  --topic $SINK_TOPIC --partitions $PARTITIONS --replication-factor $REPLICATION
+
+echo "Topic creation requested (if they didn't exist)."
+exit 0 # Ensure script exits cleanly
+```
+
+**7.2. `scripts/schema.cql`**
+
+```cql
+-- Use environment variables for keyspace/table if possible via cqlsh options,
+-- otherwise hardcode for the specific deployment environment.
+-- Example uses default names.
+
+-- Create Keyspace (Idempotent)
+-- Use SimpleStrategy for single DC/test, NetworkTopologyStrategy for multi-DC prod
+CREATE KEYSPACE IF NOT EXISTS app_keyspace
+  WITH REPLICATION = {
+    'class' : 'SimpleStrategy',
+    'replication_factor' : 1 -- Adjust for production (e.g., 3)
+  };
+
+-- Use the keyspace
+USE app_keyspace;
+
+-- Create Table (Idempotent)
+-- Match fields with DataTransferObject.java
+CREATE TABLE IF NOT EXISTS data_table (
+    id TEXT PRIMARY KEY,          -- Example primary key
+    payload_data TEXT,
+    timestamp BIGINT              -- Assuming epoch milliseconds
+    -- Add other fields as needed
+);
+
+-- Optionally add secondary indexes if query patterns require them
+-- CREATE INDEX IF NOT EXISTS ON data_table (timestamp);
+```
+
+**7.3. `scripts/setup_cassandra_schema.sh`**
+
+```bash
+#!/bin/bash
+
+CASSANDRA_HOST=$1
+CASSANDRA_PORT=${2:-9042}
+CQL_FILE=${3:-/scripts/schema.cql} # Path inside container
+KEYSPACE=${CASSANDRA_KEYSPACE:-app_keyspace} # Get from env or default
+
+if [ -z "$CASSANDRA_HOST" ]; then
+  echo "Usage: $0 <cassandra-host> [cassandra-port] [cql-file-path]"
+  echo "Example: $0 cassandra 9042 /scripts/schema.cql"
+  exit 1
+fi
+
+echo "Connecting to Cassandra at $CASSANDRA_HOST:$CASSANDRA_PORT"
+echo "Applying schema from $CQL_FILE"
+
+# Loop until cqlsh can connect and execute, with a timeout
+MAX_RETRIES=12
+RETRY_DELAY=10
+COUNT=0
+
+until cqlsh $CASSANDRA_HOST $CASSANDRA_PORT -k $KEYSPACE -f $CQL_FILE --request-timeout=30; do
+  COUNT=$((COUNT + 1))
+  if [ $COUNT -ge $MAX_RETRIES ]; then
+    echo "Failed to connect to Cassandra and apply schema after $MAX_RETRIES attempts."
+    exit 1
+  fi
+  echo "Cassandra not ready, retrying in $RETRY_DELAY seconds... (Attempt $COUNT/$MAX_RETRIES)"
+  sleep $RETRY_DELAY
+done
+
+echo "Cassandra schema setup successful."
+exit 0
+```
+
+**7.4. Deployment Strategy (`docker-compose.yml`)**
+
+Use initialization containers or service dependencies with health checks to ensure resources are ready before the main application starts.
+
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.8
+    container_name: prod-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - prodnet
+    # Add volume for data persistence
+
+  kafka:
+    image: confluentinc/cp-server:7.5.8
+    container_name: prod-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092" # External access if needed
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,PLAINTEXT://<host_ip_or_dns>:9092 # Internal and external
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1 # Set to 3+ in prod cluster
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # Set to 3+ in prod cluster
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1 # Set to 2+ in prod cluster
+      CONFLUENT_SUPPORT_CUSTOMER_ID: 'anonymous'
+      # Add other production configs (memory, etc.)
+    networks:
+      - prodnet
+    healthcheck:
+        test: ["CMD-SHELL", "cub kafka-ready -b kafka:19092 1 1 --timeout 30"] # Check if broker 1 is ready
+        interval: 10s
+        timeout: 5s
+        retries: 10
+    # Add volume for data persistence
+
+  cassandra:
+    image: datastax/dse-server:6.8.9
+    container_name: prod-cassandra
+    environment:
+      - DS_LICENSE=accept
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch # Or appropriate prod snitch
+      - CASSANDRA_DC=datacenter1 # Use consistent DC name
+      - CASSANDRA_RACK=rack1     # Use consistent RACK name
+    ports:
+      - "9042:9042"
+    networks:
+      - prodnet
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    # Add volume for data persistence
+
+  # Initialization container for Kafka Topics
+  init-kafka:
+    image: confluentinc/cp-server:7.5.8 # Needs kafka-topics
+    container_name: init-kafka
+    depends_on:
+      kafka:
+        condition: service_healthy # Wait for Kafka healthcheck
+    networks:
+      - prodnet
+    volumes:
+      - ./scripts:/scripts
+    command: ["/scripts/create_kafka_topics.sh", "kafka:19092"] # Pass internal broker list
+    # This container runs once and exits.
+    # Consider restart policy 'no' or 'on-failure' if needed
+
+  # Initialization container for Cassandra Schema (using DSE image which has cqlsh)
+  init-cassandra:
+    image: datastax/dse-server:6.8.9 # Has cqlsh
+    container_name: init-cassandra
+    depends_on:
+      cassandra:
+        condition: service_healthy # Wait for Cassandra healthcheck
+    networks:
+      - prodnet
+    volumes:
+      - ./scripts:/scripts
+    environment:
+        # Pass keyspace if needed by schema script/cqlsh command
+        CASSANDRA_KEYSPACE: app_keyspace
+    command: ["/scripts/setup_cassandra_schema.sh", "cassandra"] # Pass service name
+    # This container runs once and exits.
+
+  # The main stream processor application
+  stream-processor:
+    image: your-dockerhub-repo/kafka-cassandra-processor:latest # Use the built image
+    container_name: stream-processor
+    depends_on:
+      init-kafka: # Wait for topic creation to finish
+        condition: service_completed_successfully # Or service_started if script handles waiting
+      init-cassandra: # Wait for schema setup to finish
+        condition: service_completed_successfully # Or service_started
+      # Direct dependency on healthy services is also good
+      kafka:
+         condition: service_healthy
+      cassandra:
+         condition: service_healthy
+    networks:
+      - prodnet
+    volumes:
+      - ./production-config:/config # Mount production config file(s)
+    environment:
+      # Override config path if needed, defaults to /config/application.properties
+      # CONFIG_PATH: /config/custom.properties
+      # Pass any sensitive info via environment variables or Docker secrets
+      # JAVA_OPTS: "-Xmx1g -Xms1g ..." # Set JVM memory options
+      # Ensure JMX Exporter Agent config is correct in the image/env
+    ports:
+      - "8080:8080" # Expose Health check port
+      - "7071:7071" # Expose JMX Exporter port
+    restart: always # Restart policy for the main app
+
+  prometheus: # Example monitoring setup
+     image: prom/prometheus:latest
+     container_name: prometheus
+     ports: ["9090:9090"]
+     volumes: ['./prometheus.yml:/etc/prometheus/prometheus.yml'] # Mount Prometheus config
+     networks: [prodnet]
+     command: '--config.file=/etc/prometheus/prometheus.yml'
+     depends_on: [stream-processor]
+
+  grafana: # Example dashboarding
+    image: grafana/grafana-oss:latest
+    ports: ["3000:3000"]
+    networks: [prodnet]
+    depends_on: [prometheus]
+    # Add volume for Grafana data
+
+networks:
+  prodnet:
+
+volumes:
+  # Define volumes for Kafka, ZK, Cassandra data persistence if needed
+  # kafka-data:
+  # zookeeper-data:
+  # cassandra-data:
+```
+*(Note: Production `docker-compose.yml` needs adjustments for replication factors, resource limits, persistent volumes, security, and potentially using Docker Swarm/Kubernetes instead of plain Compose for orchestration.)*
