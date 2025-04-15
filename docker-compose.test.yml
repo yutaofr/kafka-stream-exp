@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.8
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - test-network
+
+  # Kafka - Message broker
+  kafka:
+    image: confluentinc/cp-server:7.5.8
+    depends_on:
+      - zookeeper
+    ports:
+      - "19092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - test-network
+
+  # Cassandra - Database
+  cassandra:
+    image: datastax/dse-server:6.8.9
+    environment:
+      - DS_LICENSE=accept
+      - JVM_EXTRA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "19042:9042"
+    networks:
+      - test-network
+
+  # Integration tests
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      - kafka
+      - cassandra
+    volumes:
+      - .:/app
+      - ~/.m2:/root/.m2
+    command: >
+      sh -c "
+        # Wait for Kafka
+        echo 'Waiting for Kafka to be ready...'
+        until nc -z kafka 9092; do
+          sleep 1
+        done
+        
+        # Wait for Cassandra
+        echo 'Waiting for Cassandra to be ready...'
+        until nc -z cassandra 9042; do
+          sleep 1
+        done
+        
+        # Run tests
+        echo 'Running integration tests...'
+        cd /app && mvn verify
+      "
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge 

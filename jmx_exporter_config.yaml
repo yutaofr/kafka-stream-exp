@@ -1,0 +1,78 @@
+---
+startDelaySeconds: 0
+hostPort: 127.0.0.1:9999
+ssl: false
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+# Kafka Streams metrics
+rules:
+  # Cassandra driver metrics
+  - pattern: "com.datastax.oss.driver<type=(.+), name=(.+)><>Value"
+    name: cassandra_driver_$1_$2
+    help: "Cassandra driver metrics ($1)"
+    type: GAUGE
+    attrNameSnakeCase: true
+
+  # Kafka Streams metrics
+  - pattern: "kafka.streams<type=stream-(.+), thread-id=(.+)><>(.+): (.+)"
+    name: kafka_streams_$1_$3
+    help: "Kafka Streams metric: $3"
+    type: GAUGE
+    labels:
+      thread: "$2"
+    
+  - pattern: "kafka.streams<type=stream-(.+)><>(.+): (.+)"
+    name: kafka_streams_$1_$2
+    help: "Kafka Streams metric: $2"
+    type: GAUGE
+    
+  # Kafka consumer metrics
+  - pattern: "kafka.consumer<type=consumer-fetch-manager-metrics, client-id=(.+)><>(.+): (.+)"
+    name: kafka_consumer_$2
+    help: "Kafka consumer metric: $2"
+    type: GAUGE
+    labels:
+      client_id: "$1"
+      
+  - pattern: "kafka.consumer<type=consumer-metrics, client-id=(.+)><>(.+): (.+)"
+    name: kafka_consumer_$2
+    help: "Kafka consumer metric: $2"
+    type: GAUGE
+    labels:
+      client_id: "$1"
+     
+  # Kafka producer metrics
+  - pattern: "kafka.producer<type=producer-metrics, client-id=(.+)><>(.+): (.+)"
+    name: kafka_producer_$2
+    help: "Kafka producer metric: $2"
+    type: GAUGE
+    labels:
+      client_id: "$1"
+      
+  # Common JVM metrics
+  - pattern: "java.lang<type=OperatingSystem><>(.+):"
+    name: jvm_os_$1
+    help: "JVM OS metric: $1"
+    type: GAUGE
+    attrNameSnakeCase: true
+  
+  - pattern: "java.lang<type=Memory><>HeapMemoryUsage:"
+    name: jvm_memory_heap_$1
+    help: "JVM memory heap usage"
+    type: GAUGE
+    attrNameSnakeCase: true
+    
+  - pattern: "java.lang<type=GarbageCollector, name=(.+)><>CollectionCount"
+    name: jvm_gc_collection_count
+    help: "Garbage collection count"
+    type: COUNTER
+    labels:
+      gc: "$1"
+    
+  - pattern: "java.lang<type=GarbageCollector, name=(.+)><>CollectionTime"
+    name: jvm_gc_collection_time_ms
+    help: "Garbage collection time (ms)"
+    type: COUNTER
+    labels:
+      gc: "$1" 

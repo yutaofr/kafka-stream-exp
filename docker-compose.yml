@@ -1,0 +1,136 @@
+services:
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.5
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    restart: unless-stopped
+    healthcheck:
+      test: nc -z localhost 2181 || exit -1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - kafka-cassandra-network
+
+  # Kafka - Message broker
+  kafka:
+    image: confluentinc/cp-server:7.6.5
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - kafka-cassandra-network
+
+  # Cassandra - Database
+  cassandra:
+    image: cassandra:latest
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - kafka-cassandra-network
+
+  # Init container to set up Kafka topics and Cassandra schema
+  init:
+    image: confluentinc/cp-server:7.6.5
+    container_name: init
+    depends_on:
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka and Cassandra to be ready...' &&
+        sleep 10 &&
+        echo 'Creating Kafka topics...' &&
+        /scripts/create_kafka_topics.sh --bootstrap-servers kafka:9092 --replication-factor 1 &&
+        echo 'Setting up Cassandra schema...' &&
+        apt-get update &&
+        apt-get install -y python3 python3-pip &&
+        pip3 install cqlsh &&
+        /scripts/setup_cassandra_schema.sh --host cassandra --schema-file /scripts/schema.cql
+      "
+    networks:
+      - kafka-cassandra-network
+
+  # Kafka-Cassandra Stream Processor
+  stream-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stream-processor
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+      - "9999:9999"
+    volumes:
+      - ./config:/config
+    environment:
+      JAVA_OPTS: "-Xms512m -Xmx1g"
+    restart: unless-stopped
+    networks:
+      - kafka-cassandra-network
+
+  # Prometheus - Metrics scraper (optional)
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: unless-stopped
+    networks:
+      - kafka-cassandra-network
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  cassandra_data:
+
+networks:
+  kafka-cassandra-network:
+    driver: bridge 

@@ -1,0 +1,15 @@
+FROM maven:3.8.6-openjdk-11-slim
+
+# Install required packages for wait scripts
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    netcat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Entry point will be provided by docker-compose.test.yml 
