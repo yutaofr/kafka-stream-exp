@@ -47,16 +47,16 @@ graph LR
     end
 
     subgraph "Application Container (Docker)"
-        A[Stream Processor App] -->|Writes (QUORUM)| CDB
-        A -->|Produces (EOS)| K_Sink
-        K_Source -->|Consumes (EOS)| A
-        ConfVol[/config Volume] -->|Reads Config| A
+        A[Stream Processor App] -- "Writes (QUORUM)" --> CDB
+        A -- "Produces (EOS)" --> K_Sink
+        K_Source -- "Consumes (EOS)" --> A
+        ConfVol[/config Volume\] -- "Reads Config" --> A  
         JMX{JMX Exporter Agent} -- Attaches --> A
         HC{Health Check Endpoint} -- Exposed --> A
     end
 
-    Prom -->|Scrapes :PORT| JMX
-    Docker -->|Checks /health| HC
+    Prom -- "Scrapes :PORT" --> JMX
+    Docker -- "Checks /health" --> HC
 
     style A fill:#ccf,stroke:#333,stroke-width:2px
     style ConfVol fill:#eee,stroke:#999
